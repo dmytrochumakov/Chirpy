@@ -1,157 +1,157 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
-	"fmt"
 	"log"
-	"net/http"	
-	"strings"
+	"net/http"
+	"os"
+	"sync/atomic"
+
+	"github.com/dmytrochumakov/chirpy/internal/database"
+	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
 )
 
+type apiConfig struct {
+	fileserverHits atomic.Int32
+	envPlatform    string
+	db             *database.Queries
+	jwtSecret      string
+	polkaKey       string
+}
+
 func main() {
+	err := godotenv.Load(".env")
+	if err != nil {
+		log.Fatal(err)
+		return
+	}
+
+	dbURL := os.Getenv("DB_URL")
+	envPlatform := os.Getenv("PLATFORM")
+	jwtSecret := os.Getenv("JWT_SECRET")
+	polkaKey := os.Getenv("POLKA_KEY")
+	db, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		log.Fatal(err)
+		return
+	}
+
 	const filepathRoot = "."
 	const port = "8080"
+	dbQueries := database.New(db)
 
-	apiCfg := apiConfig{
-		fileserverHits: 0,
+	apiCfg := &apiConfig{
+		fileserverHits: atomic.Int32{},
+		envPlatform:    envPlatform,
+		db:             dbQueries,
+		jwtSecret:      jwtSecret,
+		polkaKey:       polkaKey,
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/app/*", apiCfg.middlewareMetricsInc(http.StripPrefix("/app", http.FileServer(http.Dir(filepathRoot)))))
-	mux.HandleFunc("GET /api/healthz" , healthz)
-	mux.HandleFunc("GET /admin/metrics" , apiCfg.handlerMetrics)
-	mux.HandleFunc("/api/reset" , apiCfg.resetFileserverHits)
-	mux.HandleFunc("POST /api/validate_chirp" , validate_chirp)
+	mux.Handle("/app/", apiCfg.middlewareMetricsInc(http.StripPrefix("/app", http.FileServer(http.Dir(filepathRoot)))))
+	mux.HandleFunc("GET /api/healthz", handlerHealthz)
+	mux.HandleFunc("GET /admin/metrics", apiCfg.handlerMetrics)
+	mux.HandleFunc("POST /admin/reset", apiCfg.handlerReset)
+	mux.HandleFunc("POST /api/validate_chirp", handlerValidateChirp)
+	mux.HandleFunc("POST /api/users", apiCfg.handlerCreateUser)
+	mux.HandleFunc("POST /api/chirps", apiCfg.handlerCreateChirp)
+	mux.HandleFunc("GET /api/chirps", apiCfg.handlerGetAllChirps)
+	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.handlerGetChirpByID)
+	mux.HandleFunc("POST /api/login", apiCfg.handlerLogin)
+	mux.HandleFunc("POST /api/refresh", apiCfg.handlerRefresh)
+	mux.HandleFunc("POST /api/revoke", apiCfg.handlerRevoke)
+	mux.HandleFunc("PUT /api/users", apiCfg.handlerUpdateUserEmailAndPassword)
+	mux.HandleFunc("DELETE /api/chirps/{chirpID}", apiCfg.handlerDeleteChirp)
+	mux.HandleFunc("POST /api/polka/webhooks", apiCfg.handlerWebhooks)
 
-	srv := &http.Server{
+	server := &http.Server{
 		Addr:    ":" + port,
 		Handler: mux,
 	}
 
 	log.Printf("Serving on port: %s\n", port)
-	log.Fatal(srv.ListenAndServe())
+	log.Fatal(server.ListenAndServe())
 }
 
-func healthz(w http.ResponseWriter, r *http.Request) {
-	w.Header().Add("Content-Type", "text/plain; charset=utf-8")
+func writeCleanedBody(w http.ResponseWriter, cleanedBody string) {
+	type responseCleanedBody struct {
+		CleanedBody string `json:"cleaned_body"`
+	}
+	resp := responseCleanedBody{}
+	resp.CleanedBody = cleanedBody
+
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(http.StatusText(http.StatusOK)))
-}
 
-type apiConfig struct {
-	fileserverHits int
-}
-
-func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cfg.fileserverHits++
-		next.ServeHTTP(w, r)
-	})
-}
-
-func (cfg *apiConfig)handlerMetrics(w http.ResponseWriter, r *http.Request) {
-	w.Header().Add("Content-Type", "text/html")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(fmt.Sprintf(`
-<html>
-
-<body>
-	<h1>Welcome, Chirpy Admin</h1>
-	<p>Chirpy has been visited %d times!</p>
-</body>
-
-</html>
-	`, cfg.fileserverHits)))
-}
-
-func (cfg *apiConfig) resetFileserverHits(w http.ResponseWriter, r *http.Request) {
-	cfg.fileserverHits = 0
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Hits reset to 0"))
-}
-
-func validate_chirp(w http.ResponseWriter, r *http.Request) {
-	type parameters struct {        
-        Body string `json:"body"`        
-    }
-	type returnVals struct {
-		Valid bool `json:"valid"`
-	}
-	type returnCleanBodyVals struct {
-		CleanBody string `json:"cleaned_body"`
-	}
-
-    decoder := json.NewDecoder(r.Body)
-    params := parameters{}
-    err := decoder.Decode(&params)
-    if err != nil {		
-		respondWithError(w, http.StatusBadRequest, "Couldn't decode parameters")
-		return
-    }
-
-	const maxChirpLength = 140
-	if len(params.Body) > maxChirpLength {
-		respondWithError(w, http.StatusBadRequest, "Chirp is too long")
-		return
-	}
-
-	lowerBody := strings.ToLower(params.Body)	
-	badWords := map[string]struct{}{
-		"kerfuffle": {},
-		"sharbert":  {},
-		"fornax":    {},
-	}
-	if strings.Contains(lowerBody, "kerfuffle") || strings.Contains(lowerBody, "sharbert") || strings.Contains(lowerBody, "fornax") {
-		
-		replacedBody := getCleanedBody(params.Body, badWords)
-		respondWithJSON(w, http.StatusOK, returnCleanBodyVals{
-			CleanBody: replacedBody,	
-		})
-		return
-	} else {
-		respondWithJSON(w, http.StatusOK, returnCleanBodyVals{
-			CleanBody: params.Body,
-		})
-		return
-	}
-
-	respondWithJSON(w, http.StatusOK, returnVals{
-		Valid: true,
-	})
-}
-
-func respondWithError(w http.ResponseWriter, code int, msg string) {
-	if code > 499 {
-		log.Printf("Responding with 5XX error: %s", msg)
-	}
-	type errorResponse struct {
-		Error string `json:"error"`
-	}
-	respondWithJSON(w, code, errorResponse{
-		Error: msg,
-	})
-}
-
-func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	dat, err := json.Marshal(payload)
+	dat, err := json.Marshal(resp)
 	if err != nil {
 		log.Printf("Error marshalling JSON: %s", err)
-		w.WriteHeader(500)
+		write500Error(w)
 		return
 	}
-	w.WriteHeader(code)
 	w.Write(dat)
 }
 
-func getCleanedBody(body string, badWords map[string]struct{}) string {
-	words := strings.Split(body, " ")
-	for i, word := range words {
-		loweredWord := strings.ToLower(word)
-		if _, ok := badWords[loweredWord]; ok {
-			words[i] = "****"
-		}
+func writeStatusCodeResponse(w http.ResponseWriter, statusCode int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+}
+
+func writeJSONResponse(w http.ResponseWriter, statusCode int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+
+	response, err := json.Marshal(data)
+	if err != nil {
+		log.Printf("Error marshalling JSON: %s", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
 	}
-	cleaned := strings.Join(words, " ")
-	return cleaned
+
+	_, writeErr := w.Write(response)
+	if writeErr != nil {
+		log.Printf("Error writing response: %s", writeErr)
+	}
+}
+
+func writeError(w http.ResponseWriter, code int, error string) {
+	type responseError struct {
+		Error string `json:"error"`
+	}
+	respError := responseError{}
+
+	w.WriteHeader(code)
+	respError.Error = error
+
+	dat, err := json.Marshal(respError)
+	if err != nil {
+		log.Printf("Error marshalling JSON: %s", err)
+		write500Error(w)
+		return
+	}
+	w.Write(dat)
+}
+
+func write500Error(w http.ResponseWriter) {
+	writeError(w, 500, "Something went wrong")
+}
+
+func write403Error(w http.ResponseWriter) {
+	writeError(w, 403, "403 Forbidden")
+}
+
+func write404Error(w http.ResponseWriter) {
+	writeError(w, 404, "404 Not Found")
+}
+
+func write401Error(w http.ResponseWriter) {
+	writeError(w, 401, "401 Unauthorized")
+}
+
+func DecodeJSON[T any](r *http.Request, target *T) error {
+	decoder := json.NewDecoder(r.Body)
+	defer r.Body.Close()
+	return decoder.Decode(target)
 }
